@@ -1,0 +1,973 @@
+# ============================================================
+# Mixed Effects: Treatment-only with adaptive nested random effects
+# FULL VERSION WITH:
+# + Explicit nested image variance modeling
+# + Variance component outputs
+# + Well-mean plotting (avoids pseudoreplication)
+# + Raw + log models
+# + Diagnostics
+# + LRTs
+# ============================================================
+
+# ----------------- PACKAGES -----------------
+suppressPackageStartupMessages({
+  library(lmerTest)
+  library(lme4)
+  library(ggplot2)
+  library(dplyr)
+})
+
+options(warn = -1)
+
+# ============================================================
+# SETTINGS
+# ============================================================
+
+input_dir <- '//Users/allisonpickle/Desktop/NIH'
+file_pattern <- "\\.csv$"
+
+rename_cols_by_position <- c(
+  Results = 6
+)
+
+baseline_treatment <- "Tri_Ctrl"
+
+treatment_levels <- c(
+  "Tri_Ctrl",
+  "Tri_w3",
+  "1hrw3_100ng",
+  "1100ng_LPS"
+)
+
+treatment_labels <- c(
+  "10 µM w3"    = "+\n+\n-",
+  "100ng_LPS" = "-\n+\n+"
+)
+
+row_labels <- c(
+  "10 µM w3",
+  "100 ng/mL LPS"
+)
+
+plot_title_base <- "Treatment"
+x_axis_label <- ""
+y_axis_label_raw <- "Results (mean ± SE)"
+y_axis_label_log <- "log(Results + 0.5) (mean ± SE)"
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+add_stars <- function(p) {
+  if (is.na(p)) return("")
+  if (p < 0.001) return("***")
+  if (p < 0.01) return("**")
+  if (p < 0.05) return("*")
+  ""
+}
+
+make_aligned_tick_labels <- function(levels_vec, labels_named_vec) {
+
+  out <- rep("", length(levels_vec))
+  names(out) <- levels_vec
+
+  common <- intersect(levels_vec, names(labels_named_vec))
+  out[common] <- as.character(labels_named_vec[common])
+
+  out
+}
+
+# ============================================================
+# MODEL FITTING
+# ============================================================
+
+fit_treatment_model <- function(df,
+                                response = c("Results", "logResults")) {
+
+  response <- match.arg(response)
+
+  df$Biological_Rep <- droplevels(factor(df$Biological_Rep))
+  df$Well <- droplevels(factor(df$Well))
+  df$Treatment <- droplevels(
+    factor(df$Treatment, levels = treatment_levels)
+  )
+
+  has_img <- "Image" %in% names(df)
+
+  if (has_img) {
+
+    df$Image <- droplevels(factor(df$Image))
+
+    # --------------------------------------------------------
+    # Explicit nested IDs
+    # --------------------------------------------------------
+
+    df$BioWell <- interaction(
+      df$Biological_Rep,
+      df$Well,
+      drop = TRUE
+    )
+
+    df$BioWellImage <- interaction(
+      df$Biological_Rep,
+      df$Well,
+      df$Image,
+      drop = TRUE
+    )
+
+    df$WellImage <- interaction(
+      df$Well,
+      df$Image,
+      drop = TRUE
+    )
+  }
+
+  n <- nrow(df)
+  n_bio <- nlevels(df$Biological_Rep)
+
+  can_use_img <- FALSE
+
+  if (has_img) {
+
+    can_use_img <-
+      (nlevels(df$BioWellImage) < n) &&
+      any(table(df$BioWellImage) >= 2)
+  }
+
+  # --------------------------------------------------------
+  # MODEL STRUCTURE
+  # --------------------------------------------------------
+
+  if (n_bio >= 2 && n_bio < n && has_img && can_use_img) {
+
+    f <- stats::as.formula(paste0(
+      response,
+      " ~ Treatment + ",
+      "(1 | Biological_Rep) + ",
+      "(1 | BioWell) + ",
+      "(1 | BioWellImage)"
+    ))
+
+  } else if (n_bio >= 2 && n_bio < n) {
+
+    f <- stats::as.formula(paste0(
+      response,
+      " ~ Treatment + ",
+      "(1 | Biological_Rep) + ",
+      "(1 | BioWell)"
+    ))
+
+  } else if (has_img && can_use_img) {
+
+    f <- stats::as.formula(paste0(
+      response,
+      " ~ Treatment + ",
+      "(1 | Well) + ",
+      "(1 | WellImage)"
+    ))
+
+  } else {
+
+    f <- stats::as.formula(paste0(
+      response,
+      " ~ Treatment + ",
+      "(1 | Well)"
+    ))
+  }
+
+  suppressMessages(
+    suppressWarnings(
+      lmerTest::lmer(f, data = df)
+    )
+  )
+}
+
+# ============================================================
+# NULL VS FULL MODEL
+# ============================================================
+
+make_null_full <- function(fit, response_name, df) {
+
+  base_form <- formula(fit)
+  rand_terms <- lme4::findbars(base_form)
+
+  make_form <- function(fixed_rhs) {
+
+    if (length(rand_terms) == 0) {
+
+      stats::as.formula(
+        paste0(response_name, " ~ ", fixed_rhs)
+      )
+
+    } else {
+
+      rand_part <- paste(
+        vapply(
+          rand_terms,
+          function(x) paste0("(", deparse1(x), ")"),
+          character(1)
+        ),
+        collapse = " + "
+      )
+
+      stats::as.formula(
+        paste0(response_name, " ~ ", fixed_rhs, " + ", rand_part)
+      )
+    }
+  }
+
+  null_fit <- suppressMessages(
+    suppressWarnings(
+      lme4::lmer(
+        make_form("1"),
+        data = df,
+        REML = FALSE
+      )
+    )
+  )
+
+  full_fit <- suppressMessages(
+    suppressWarnings(
+      lme4::lmer(
+        make_form("Treatment"),
+        data = df,
+        REML = FALSE
+      )
+    )
+  )
+
+  list(
+    null = null_fit,
+    full = full_fit
+  )
+}
+
+# ============================================================
+# VARIANCE COMPONENTS
+# ============================================================
+
+compute_variance_components <- function(fit) {
+
+  vc <- as.data.frame(lme4::VarCorr(fit))
+
+  var_resid <- attr(lme4::VarCorr(fit), "sc")^2
+
+  vc_out <- vc[, c("grp", "vcov")]
+  names(vc_out) <- c("Component", "Variance")
+
+  vc_out <- rbind(
+    vc_out,
+    data.frame(
+      Component = "Residual",
+      Variance = var_resid
+    )
+  )
+
+  total_var <- sum(vc_out$Variance)
+
+  vc_out$Percent <- 100 * vc_out$Variance / total_var
+
+  vc_out
+}
+
+# ============================================================
+# P-VALUES
+# ============================================================
+
+extract_treatment_pvals <- function(fit, levels_vec) {
+
+  fe <- coef(summary(fit))
+
+  rn <- rownames(fe)
+
+  is_trt <- grepl("^Treatment", rn) &
+    !grepl(":", rn)
+
+  trt_rows <- fe[is_trt, , drop = FALSE]
+
+  trt_names <- sub(
+    "^Treatment",
+    "",
+    rownames(trt_rows)
+  )
+
+  p_col <- grep(
+    "Pr\\(",
+    colnames(trt_rows),
+    value = TRUE
+  )[1]
+
+  pvals <- trt_rows[, p_col]
+
+  names(pvals) <- trt_names
+
+  p_df <- data.frame(
+    Treatment = levels_vec,
+    p.value = NA_real_,
+    stringsAsFactors = FALSE
+  )
+
+  for (i in seq_along(trt_names)) {
+
+    p_df$p.value[
+      p_df$Treatment == trt_names[i]
+    ] <- as.numeric(pvals[i])
+  }
+
+  p_df
+}
+
+# ============================================================
+# SUMMARY TABLES
+# ============================================================
+
+build_bar_summary_with_sig <- function(data,
+                                       fit,
+                                       response_col) {
+
+  summary_df <- data |>
+    dplyr::group_by(Treatment) |>
+    dplyr::summarise(
+      mean = mean(.data[[response_col]], na.rm = TRUE),
+      se = sd(.data[[response_col]], na.rm = TRUE) /
+        sqrt(sum(!is.na(.data[[response_col]]))),
+      .groups = "drop"
+    )
+
+  summary_df$Treatment <- factor(
+    summary_df$Treatment,
+    levels = levels(data$Treatment)
+  )
+
+  p_df <- extract_treatment_pvals(
+    fit,
+    levels(data$Treatment)
+  )
+
+  p_df$Treatment <- factor(
+    p_df$Treatment,
+    levels = levels(data$Treatment)
+  )
+
+  out <- dplyr::left_join(
+    summary_df,
+    p_df,
+    by = "Treatment"
+  )
+
+  out$stars <- vapply(
+    out$p.value,
+    add_stars,
+    character(1)
+  )
+
+  out
+}
+
+# ============================================================
+# PLOTTING
+# ============================================================
+
+plot_bar_p_values <- function(summ_df,
+                              raw_data,
+                              response_col,
+                              y_label,
+                              title_text) {
+
+  # --------------------------------------------------------
+  # WELL MEANS FOR PLOTTING
+  # --------------------------------------------------------
+
+  plot_data <- raw_data %>%
+    group_by(
+      Treatment,
+      Biological_Rep,
+      Well
+    ) %>%
+    summarise(
+      PlotValue = mean(
+        .data[[response_col]],
+        na.rm = TRUE
+      ),
+      .groups = "drop"
+    )
+
+  # NEW: hide legend if only 1 Biological_Rep is present
+  n_bio_plot <- dplyr::n_distinct(plot_data$Biological_Rep, na.rm = TRUE)
+  show_legend <- n_bio_plot > 1
+
+  aligned_treatment_labels <-
+    make_aligned_tick_labels(
+      treatment_levels,
+      treatment_labels
+    )
+
+  aligned_treatment_labels <-
+    stats::setNames(
+      paste0("\n", aligned_treatment_labels),
+      names(aligned_treatment_labels)
+    )
+
+  combined_row_label <- paste0(
+    "\n",
+    paste(row_labels, collapse = "\n")
+  )
+
+  p <- ggplot2::ggplot(
+    summ_df,
+    ggplot2::aes(
+      x = Treatment,
+      y = mean
+    )
+  ) +
+
+    ggplot2::geom_col(
+      fill = "#6c6c6c",
+      alpha = 0.7
+    ) +
+
+    ggplot2::geom_jitter(
+      data = plot_data,
+      ggplot2::aes(
+        x = Treatment,
+        y = PlotValue,
+        shape = Biological_Rep
+      ),
+      width = 0.15,
+      alpha = 0.75,
+      size = 2,
+      color = "#1f5fbf"
+    ) +
+
+    ggplot2::geom_errorbar(
+      ggplot2::aes(
+        ymin = mean - se,
+        ymax = mean + se
+      ),
+      width = 0.2
+    ) +
+
+    ggplot2::geom_text(
+      ggplot2::aes(
+        y = mean + se,
+        label = stars
+      ),
+      vjust = -0.5,
+      size = 7,
+      fontface = "bold"
+    ) +
+
+    ggplot2::scale_x_discrete(
+      labels = aligned_treatment_labels,
+      drop = FALSE
+    ) +
+
+    ggplot2::scale_y_continuous(
+      expand = ggplot2::expansion(mult = c(0, 0.10))
+    ) +
+
+    ggplot2::labs(
+      title = title_text,
+      x = x_axis_label,
+      y = y_label,
+      shape = if (show_legend) "Biological Rep" else NULL
+    ) +
+
+    ggplot2::theme_bw() +
+
+    ggplot2::theme(
+      panel.grid.major = ggplot2::element_blank(),
+      panel.grid.minor = ggplot2::element_blank(),
+      plot.title = ggplot2::element_text(
+        hjust = 0.5,
+        face = "bold"
+      ),
+      axis.text.x = ggplot2::element_text(
+        angle = 0,
+        hjust = 0.5,
+        vjust = -0.2,
+        lineheight = 0.8,
+        size = 9
+      ),
+      plot.margin = ggplot2::margin(
+        5, 5, 45, 55
+      ),
+      legend.position = if (show_legend) "right" else "none"  # NEW
+    ) +
+
+    ggplot2::coord_cartesian(clip = "off")
+
+  p <- p + ggplot2::annotate(
+    "text",
+    x = 0.4,
+    y = -Inf,
+    label = combined_row_label,
+    hjust = 1,
+    vjust = 1.3,
+    size = 3,
+    lineheight = 0.8
+  )
+
+  p
+}
+
+# ============================================================
+# DIAGNOSTICS
+# ============================================================
+
+save_diagnostics <- function(out_dir,
+                             raw_fit,
+                             log_fit) {
+
+  models <- list(
+    RawFit = raw_fit,
+    LogFit = log_fit
+  )
+
+  for (nm in names(models)) {
+
+    fit <- models[[nm]]
+
+    fitted_vals <- as.numeric(
+      stats::fitted(fit)
+    )
+
+    pearson_resid <- as.numeric(
+      stats::resid(fit, type = "pearson")
+    )
+
+    raw_resid <- as.numeric(
+      stats::resid(fit)
+    )
+
+    # --------------------------------------------------------
+    # Residual plot
+    # --------------------------------------------------------
+
+    res_df <- data.frame(
+      FittedValues = fitted_vals,
+      PearsonResiduals = pearson_resid
+    )
+
+    p_res <- ggplot2::ggplot(
+      res_df,
+      ggplot2::aes(
+        x = FittedValues,
+        y = PearsonResiduals
+      )
+    ) +
+
+      ggplot2::geom_point(alpha = 0.7) +
+
+      ggplot2::geom_hline(
+        yintercept = 0,
+        color = "red"
+      ) +
+
+      ggplot2::theme_bw()
+
+    ggplot2::ggsave(
+      file.path(
+        out_dir,
+        paste0(nm, "_residuals.png")
+      ),
+      p_res,
+      width = 7,
+      height = 5,
+      dpi = 200
+    )
+
+    # --------------------------------------------------------
+    # QQ plot
+    # --------------------------------------------------------
+
+    qq <- stats::qqnorm(
+      raw_resid,
+      plot.it = FALSE
+    )
+
+    qq_df <- data.frame(
+      x = qq$x,
+      y = qq$y
+    )
+
+    p_qq <- ggplot2::ggplot(
+      qq_df,
+      ggplot2::aes(x = x, y = y)
+    ) +
+
+      ggplot2::geom_point(alpha = 0.7) +
+
+      ggplot2::theme_bw()
+
+    ggplot2::ggsave(
+      file.path(
+        out_dir,
+        paste0(nm, "_qq.png")
+      ),
+      p_qq,
+      width = 7,
+      height = 5,
+      dpi = 200
+    )
+  }
+}
+
+# ============================================================
+# MODEL SUMMARIES
+# ============================================================
+
+save_model_summaries <- function(out_dir,
+                                 input_file,
+                                 analysis_data,
+                                 raw_fit,
+                                 log_fit,
+                                 vc_raw,
+                                 vc_log,
+                                 lrt_raw,
+                                 lrt_log) {
+
+  out_file <- file.path(
+    out_dir,
+    "Mixed_Model_Summaries.txt"
+  )
+
+  sink(out_file)
+
+  cat(
+    "MIXED EFFECTS MODEL SUMMARIES\n\n"
+  )
+
+  cat(
+    "Input: ",
+    input_file,
+    "\n\n",
+    sep = ""
+  )
+
+  cat("RAW MODEL\n\n")
+
+  print(summary(raw_fit))
+
+  cat("\nVariance Components (raw)\n")
+  print(vc_raw)
+
+  cat("\nLRT (raw)\n")
+  print(lrt_raw)
+
+  cat("\n\nLOG MODEL\n\n")
+
+  print(summary(log_fit))
+
+  cat("\nVariance Components (log)\n")
+  print(vc_log)
+
+  cat("\nLRT (log)\n")
+  print(lrt_log)
+
+  sink()
+}
+
+# ============================================================
+# MAIN PER-FILE RUNNER
+# ============================================================
+
+run_one_csv <- function(input_file) {
+
+  cat(
+    "\nProcessing:",
+    basename(input_file),
+    "\n"
+  )
+
+  process_data <- read.csv(
+    input_file,
+    stringsAsFactors = FALSE
+  )
+
+  # --------------------------------------------------------
+  # Optional rename
+  # --------------------------------------------------------
+  if (!is.null(rename_cols_by_position)) {
+    colnames(process_data)[
+      rename_cols_by_position[["Results"]]
+    ] <- "Results"
+  }
+
+  # --------------------------------------------------------
+  # Factor setup
+  # --------------------------------------------------------
+  process_data$Results <- suppressWarnings(
+    as.numeric(process_data$Results)
+  )
+
+  process_data$Treatment <- factor(
+    process_data$Treatment,
+    levels = treatment_levels
+  )
+
+  process_data$Treatment <- stats::relevel(
+    process_data$Treatment,
+    ref = baseline_treatment
+  )
+
+  process_data$Well <- factor(process_data$Well)
+  process_data$Biological_Rep <- factor(process_data$Biological_Rep)
+
+  if ("Image" %in% names(process_data)) {
+    process_data$Image <- factor(process_data$Image)
+  }
+
+  needed <- c("Results", "Treatment", "Well", "Biological_Rep")
+  if ("Image" %in% names(process_data)) {
+    needed <- c(needed, "Image")
+  }
+
+  analysis_data <- process_data[
+    complete.cases(process_data[, needed]),
+  ]
+
+  analysis_data$logResults <- log(analysis_data$Results + 0.5)
+
+  # --------------------------------------------------------
+  # Output folder
+  # --------------------------------------------------------
+  csv_base <- tools::file_path_sans_ext(
+    basename(input_file)
+  )
+
+  out_dir <- file.path(
+    dirname(input_file),
+    paste0("MM_Outputs_", csv_base)
+  )
+
+  dir.create(
+    out_dir,
+    showWarnings = FALSE,
+    recursive = TRUE
+  )
+
+  # --------------------------------------------------------
+  # NEW: Image-within-well variability summary (per Treatment x Well)
+  # NOTE: This treats each row as an "image measurement". If you have multiple rows per image,
+  # consider grouping by Treatment, Well, Image first.
+  # --------------------------------------------------------
+  image_variance <- analysis_data %>%
+    dplyr::group_by(Treatment, Well) %>%
+    dplyr::summarise(
+      image_mean = mean(Results, na.rm = TRUE),
+      image_sd   = sd(Results, na.rm = TRUE),
+      image_cv   = dplyr::if_else(image_mean == 0, NA_real_, 100 * image_sd / image_mean),
+      n_images   = dplyr::n(),
+      .groups = "drop"
+    )
+
+  utils::write.csv(
+    image_variance,
+    file.path(out_dir, "ImageVariation_ByTreatmentWell_Raw.csv"),
+    row.names = FALSE
+  )
+
+  # --------------------------------------------------------
+  # MODELS
+  # --------------------------------------------------------
+  raw_fit <- fit_treatment_model(
+    analysis_data,
+    response = "Results"
+  )
+
+  log_fit <- fit_treatment_model(
+    analysis_data,
+    response = "logResults"
+  )
+
+  # --------------------------------------------------------
+  # LRTs
+  # --------------------------------------------------------
+
+  nf_raw <- make_null_full(
+    raw_fit,
+    "Results",
+    analysis_data
+  )
+
+  lrt_raw <- tryCatch(
+    anova(nf_raw$null, nf_raw$full),
+    error = function(e) NULL
+  )
+
+  nf_log <- make_null_full(
+    log_fit,
+    "logResults",
+    analysis_data
+  )
+
+  lrt_log <- tryCatch(
+    anova(nf_log$null, nf_log$full),
+    error = function(e) NULL
+  )
+
+  # --------------------------------------------------------
+  # Variance components
+  # --------------------------------------------------------
+
+  vc_raw <- compute_variance_components(
+    raw_fit
+  )
+
+  vc_log <- compute_variance_components(
+    log_fit
+  )
+
+  write.csv(
+    vc_raw,
+    file.path(
+      out_dir,
+      "VarianceComponents_Raw.csv"
+    ),
+    row.names = FALSE
+  )
+
+  write.csv(
+    vc_log,
+    file.path(
+      out_dir,
+      "VarianceComponents_Log.csv"
+    ),
+    row.names = FALSE
+  )
+
+  # --------------------------------------------------------
+  # PLOTS
+  # --------------------------------------------------------
+
+  summ_raw <- build_bar_summary_with_sig(
+    analysis_data,
+    raw_fit,
+    "Results"
+  )
+
+  p_raw <- plot_bar_p_values(
+    summ_raw,
+    analysis_data,
+    "Results",
+    y_axis_label_raw,
+    paste0(plot_title_base, " (raw)")
+  )
+
+  ggplot2::ggsave(
+    file.path(
+      out_dir,
+      "Barplot_RawFit.png"
+    ),
+    p_raw,
+    width = 6,
+    height = 4,
+    dpi = 300
+  )
+
+  summ_log <- build_bar_summary_with_sig(
+    analysis_data,
+    log_fit,
+    "logResults"
+  )
+
+  p_log <- plot_bar_p_values(
+    summ_log,
+    analysis_data,
+    "logResults",
+    y_axis_label_log,
+    paste0(plot_title_base, " (log)")
+  )
+
+  ggplot2::ggsave(
+    file.path(
+      out_dir,
+      "Barplot_LogFit.png"
+    ),
+    p_log,
+    width = 6,
+    height = 4,
+    dpi = 300
+  )
+
+  # --------------------------------------------------------
+  # Diagnostics
+  # --------------------------------------------------------
+
+  save_diagnostics(
+    out_dir,
+    raw_fit,
+    log_fit
+  )
+
+  # --------------------------------------------------------
+  # Summaries
+  # --------------------------------------------------------
+
+  save_model_summaries(
+    out_dir,
+    input_file,
+    analysis_data,
+    raw_fit,
+    log_fit,
+    vc_raw,
+    vc_log,
+    lrt_raw,
+    lrt_log
+  )
+
+  cat(
+    "Done:",
+    out_dir,
+    "\n"
+  )
+}
+
+# ============================================================
+# RUN ALL FILES
+# ============================================================
+
+csv_files <- list.files(
+  input_dir,
+  pattern = file_pattern,
+  full.names = TRUE
+)
+
+if (length(csv_files) == 0) {
+
+  stop(
+    "No CSV files found in: ",
+    input_dir
+  )
+}
+
+cat(
+  "Found ",
+  length(csv_files),
+  " file(s)\n",
+  sep = ""
+)
+
+results <- lapply(
+  csv_files,
+  function(f) {
+
+    tryCatch(
+
+      run_one_csv(f),
+
+      error = function(e) {
+
+        message(
+          "FAILED: ",
+          basename(f),
+          " -> ",
+          conditionMessage(e)
+        )
+
+        NULL
+      }
+    )
+  }
+)

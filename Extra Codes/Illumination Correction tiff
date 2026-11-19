@@ -1,0 +1,107 @@
+# Make a corrected pathway
+from basicpy import BaSiC
+
+
+def Illumination_correction(folder_path):
+    # Create a new folder for corrected images
+    # corrected_folder = os.path.join(folder_path, "Corrected")
+    # os.makedirs(corrected_folder, exist_ok=True)
+
+    # Initialize a list to store the corrected images
+    # corrected_images = []
+
+    # Iterate over each image file in the folder
+    for filename in os.listdir(folder_path):
+        if filename.endswith(".tiff"):
+            # Specify the path to the TIFF file
+            tiff_path = os.path.join(folder_path, filename)
+
+            # Read the TIFF file
+            im = load_image(str(tiff_path), volume=True)
+
+            for i in range(im.shape[0]):
+                images = im[i]
+
+                # Reshape the image to (1, height, width)
+                imageNew = np.reshape(images, (1, images.shape[0], images.shape[1]))
+
+                # Perform illumination correction
+                basic = BaSiC(get_darkfield=True, smoothness_flatfield=1)
+                basic.fit(imageNew)
+                images_transformed = basic.transform(imageNew)
+
+
+                # Display the original and corrected images
+                fig, axes = plt.subplots(1, 2, figsize=(6, 3))
+                im1 = axes[0].imshow(im[0])
+                fig.colorbar(im1, ax=axes[0])
+                im2 = axes[1].imshow(np.array(images_transformed[0]))
+                fig.colorbar(im2, ax=axes[1])
+                axes[0].set_title(f"Original - {filename}", fontsize=7)
+                axes[1].set_title(f"Corrected - Compiled", fontsize=7)
+                plt.show()
+
+Illumination_correction("/Users/allisonpickle/Desktop/Visualization/Tri-Culture")
+
+
+#WORKS:
+
+def Illumination_Correction(folder_path, factor, display=True, save=True):
+    """
+    Perform illumination correction on TIFF images in a folder.
+
+    Parameters
+    ----------
+    folder_path : str
+        Path to the folder containing TIFF images.
+    factor : float
+        Smoothness factor for flatfield correction.
+    display : bool, optional
+        Whether to display the original and corrected images. Default is True.
+    save : bool, optional
+        Whether to save the corrected images. Default is True.
+    """
+    import numpy as np
+    from basicpy import BaSiC
+    from matplotlib import pyplot as plt
+    import os
+    from tifffile import imsave
+
+    # Iterate over each image file in the folder
+    for filename in os.listdir(folder_path):
+        if filename.endswith(".tiff"):
+            print(f"Processing file: {filename}")
+            
+            # Specify the path to the TIFF file
+            tiff_path = os.path.join(folder_path, filename)
+
+            # Read the TIFF file
+            images = plt.imread(tiff_path)
+
+            # Change images to a 3D array with shape (1, height, width) from 2D
+            images = np.expand_dims(images, axis=0)
+            basic = BaSiC(get_darkfield=True, smoothness_flatfield=factor, smoothness_darkfield=1)
+            basic.fit(images)
+
+            # Apply the correction
+            images_transformed = basic.transform(images)
+
+            # Display the original and corrected images if display is enabled
+            if display:
+                fig, axes = plt.subplots(1, 2, figsize=(12, 6))
+                axes[0].imshow(images[0], cmap='gray')
+                axes[0].set_title(f"Original - {filename}", fontsize=7)
+                axes[0].axis('off')  # Remove axes
+                axes[1].imshow(images_transformed[0], cmap='gray')
+                axes[1].set_title(f"Corrected - {filename}", fontsize=7)
+                axes[1].axis('off')  # Remove axes
+                plt.show()
+
+            # Save the corrected image to the original file if save is enabled
+            if save:
+                imsave(tiff_path, images_transformed[0].astype(np.float32))
+                print(f"Saved corrected image to: {tiff_path}")
+
+# Example usage
+folder_path = '/Users/allisonpickle/Desktop/Plate_1_Background Subtraction'
+Illumination_Correction(folder_path, factor=1, display=False, save=True)
